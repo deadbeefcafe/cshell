@@ -1,2 +1,2 @@
-# go-shell
-A simple command shell
+# cshell
+A go package implementing a simple command line shell
