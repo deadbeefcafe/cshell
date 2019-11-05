@@ -3,6 +3,7 @@ package cshell
 import (
 	"fmt"
 	"io"
+	"strings"
 )
 
 const (
@@ -21,15 +22,23 @@ const (
 	ASCII_DEL   = 0x7F
 )
 
+type CommandFunc = func(args []string) error
+type Command struct {
+	name string
+	desc string
+	fx   CommandFunc
+}
+
 type Shell struct {
-	Prompt string
-	Echo   bool
-	buffer []byte
-	pos    int
-	len    int
-	state  int
-	out    io.Writer
-	inp    io.Reader
+	Prompt   string
+	Echo     bool
+	buffer   []byte
+	pos      int
+	len      int
+	state    int
+	out      io.Writer
+	inp      io.Reader
+	commands []Command
 }
 
 // Printf sends output to the configured io.Writer
@@ -83,7 +92,48 @@ func (s *Shell) redraw() {
 
 // execute a complete line
 func (s *Shell) execute() {
-	s.Printf("execute[%s]\r\n", string(s.buffer[:s.len]))
+	//s.Printf("execute[%s]\r\n", string(s.buffer[:s.len]))
+
+	args := strings.Fields(string(s.buffer[:s.len]))
+	//args := strings.Fields(s)
+	if len(args) <= 0 {
+		return
+	}
+
+	var cmd *Command
+	for i, _ := range s.commands {
+		c := &s.commands[i]
+		if c.name == args[0] {
+			cmd = c
+			break
+		}
+		if strings.HasPrefix(c.name, args[0]) {
+			if cmd != nil {
+				s.Printf("Error: multiple matches\r\n")
+				return
+			}
+			cmd = c
+		}
+	}
+	if cmd == nil {
+		s.Printf("No such command: %s\r\n", args[0])
+		return
+	}
+	err := cmd.fx(args)
+	if err != nil {
+		s.Printf("Command %s error: %v\r\n", args[0], err)
+	}
+}
+
+func (s *Shell) Command(name string, desc string, fx CommandFunc) {
+	s.commands = append(s.commands, Command{name: name, desc: desc, fx: fx})
+}
+
+func (s *Shell) Help(args []string) error {
+	for _, cmd := range s.commands {
+		s.Printf("%-10.10s %s\r\n", cmd.name, cmd.desc)
+	}
+	return nil
 }
 
 // input will process a single character generating the shell behavior.
@@ -239,5 +289,6 @@ func New() (s *Shell) {
 		Echo:   true,
 		buffer: make([]byte, 256),
 	}
+	s.Command("help", "Print commands", s.Help)
 	return
 }
