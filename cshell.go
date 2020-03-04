@@ -1,6 +1,7 @@
 package cshell
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strings"
@@ -67,6 +68,17 @@ func (s *Shell) putc(ch byte) {
 // output a string
 func (s *Shell) puts(str string) {
 	s.out.Write([]byte(str))
+}
+
+// HexDump outputs a `hexdump -C` like dump of the buf argument
+func (s *Shell) HexDump(buf []byte) {
+	dump := hex.Dump(buf)
+	for _, ch := range dump {
+		if ch == '\n' {
+			s.putc('\r')
+		}
+		s.putc(byte(ch))
+	}
 }
 
 // output the command prompt
