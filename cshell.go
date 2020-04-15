@@ -138,6 +138,9 @@ func (s *Shell) execute() {
 }
 
 func (s *Shell) Command(name string, desc string, fx CommandFunc) {
+	if s == nil {
+		return
+	}
 	s.commands = append(s.commands, Command{name: name, desc: desc, fx: fx})
 }
 
