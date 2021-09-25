@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -40,6 +41,8 @@ type Shell struct {
 	out      io.Writer
 	inp      io.Reader
 	commands []Command
+	history  []string
+	hpos     int
 }
 
 // Printf sends output to the configured io.Writer
@@ -102,12 +105,72 @@ func (s *Shell) redraw() {
 	}
 }
 
+func ParseLine(line string) (args []string, err error) {
+	var escaped, doubleQuoted, singleQuoted bool
+	buf := strings.Builder{}
+
+	for _, r := range line {
+		if escaped {
+			buf.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			if singleQuoted {
+				buf.WriteRune(r)
+			} else {
+				escaped = true
+			}
+			continue
+		}
+		if unicode.IsSpace(r) {
+			if singleQuoted || doubleQuoted {
+				buf.WriteRune(r)
+				continue
+			}
+			if buf.Len() > 0 {
+				args = append(args, buf.String())
+				buf.Reset()
+			}
+			continue
+		}
+		switch r {
+		case '"':
+			if !singleQuoted {
+				doubleQuoted = !doubleQuoted
+				continue
+			}
+		case '\'':
+			if !doubleQuoted {
+				singleQuoted = !singleQuoted
+				continue
+			}
+		}
+		buf.WriteRune(r)
+	}
+
+	if buf.Len() > 0 {
+		args = append(args, buf.String())
+	}
+
+	if escaped || doubleQuoted || singleQuoted {
+		err = fmt.Errorf("quote parse error")
+		return
+	}
+
+	return
+}
+
 // execute a complete line
 func (s *Shell) execute() {
-	//s.Printf("execute[%s]\r\n", string(s.buffer[:s.len]))
 
-	args := strings.Fields(string(s.buffer[:s.len]))
-	//args := strings.Fields(s)
+	//args := strings.Fields(string(s.buffer[:s.len]))
+	//args, err := shellwords.Parse(string(s.buffer[:s.len]))
+	args, err := ParseLine(string(s.buffer[:s.len]))
+	if err != nil {
+		return
+	}
+
 	if len(args) <= 0 {
 		return
 	}
@@ -131,7 +194,7 @@ func (s *Shell) execute() {
 		s.Printf("No such command: %s\r\n", args[0])
 		return
 	}
-	err := cmd.fx(args)
+	err = cmd.fx(args)
 	if err != nil {
 		s.Printf("Command %s error: %v\r\n", args[0], err)
 	}
@@ -265,6 +328,7 @@ func (s *Shell) Run() {
 	s.emitprompt()
 	for {
 		n, err := s.inp.Read(buf)
+		//fmt.Printf("XXXXXXX n=%d buf=<%s>\n\n", n, string(buf))
 		if err != nil {
 			fmt.Printf("read input error: %v\n", err)
 			return
