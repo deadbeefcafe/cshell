@@ -190,6 +190,16 @@ func (s *Shell) execute() {
 			cmd = c
 		}
 	}
+
+	// default command
+	for i, _ := range s.commands {
+		c := &s.commands[i]
+		if c.name == "*" {
+			cmd = c
+			break
+		}
+	}
+
 	if cmd == nil {
 		s.Printf("No such command: %s\r\n", args[0])
 		return
