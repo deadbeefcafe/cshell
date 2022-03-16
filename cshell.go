@@ -191,12 +191,14 @@ func (s *Shell) execute() {
 		}
 	}
 
-	// default command
-	for i, _ := range s.commands {
-		c := &s.commands[i]
-		if c.name == "*" {
-			cmd = c
-			break
+	if cmd == nil {
+		// default command
+		for i, _ := range s.commands {
+			c := &s.commands[i]
+			if c.name == "*" {
+				cmd = c
+				break
+			}
 		}
 	}
 
