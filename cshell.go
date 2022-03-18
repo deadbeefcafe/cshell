@@ -210,6 +210,52 @@ func (s *Shell) execute() {
 	}
 }
 
+func (s *Shell) ExecuteLine(line string) {
+	args, err := ParseLine(line)
+	if err != nil {
+		return
+	}
+
+	if len(args) <= 0 {
+		return
+	}
+
+	var cmd *Command
+	for i, _ := range s.commands {
+		c := &s.commands[i]
+		if c.name == args[0] {
+			cmd = c
+			break
+		}
+		if strings.HasPrefix(c.name, args[0]) {
+			if cmd != nil {
+				s.Printf("Error: multiple matches\r\n")
+				return
+			}
+			cmd = c
+		}
+	}
+
+	// default command
+	for i, _ := range s.commands {
+		c := &s.commands[i]
+		if c.name == "*" {
+			cmd = c
+			break
+		}
+	}
+
+	if cmd == nil {
+		s.Printf("No such command: %s\r\n", args[0])
+		return
+	}
+	err = cmd.fx(args)
+	if err != nil {
+		s.Printf("Command %s error: %v\r\n", args[0], err)
+	}
+
+}
+
 func (s *Shell) Command(name string, desc string, fx CommandFunc) {
 	if s == nil {
 		return
@@ -267,7 +313,8 @@ func (s *Shell) input(ch byte) {
 	case ch == ASCII_CR:
 		s.putc(ASCII_CR)
 		s.putc(ASCII_LF)
-		s.execute()
+		//s.execute()
+		s.ExecuteLine(string(s.buffer[:s.len]))
 		s.len = 0
 		s.pos = 0
 		s.emitprompt()
