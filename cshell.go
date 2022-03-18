@@ -264,31 +264,6 @@ func (s *Shell) input(ch byte) {
 	}
 
 	switch {
-	case ch == ASCII_TAB:
-		ch = ' '
-		fallthrough
-	case ch >= 0x20 && ch < 0x7f:
-		if s.pos < len(s.buffer) {
-			if s.pos == s.len {
-				s.putc(ch)
-				s.buffer[s.pos] = ch
-				s.pos++
-				s.len++
-			} else {
-				s.len++
-				for i := s.len; i > s.pos; i-- {
-					s.buffer[i] = s.buffer[i-1]
-				}
-				s.buffer[s.pos] = ch
-				s.pos++
-				s.redraw()
-				for i := s.pos + 1; i < s.len+1; i++ {
-					s.putc(ASCII_BS)
-				}
-			}
-		} else {
-			s.putc(ASCII_BEL)
-		}
 	case ch == ASCII_CR:
 		s.putc(ASCII_CR)
 		s.putc(ASCII_LF)
@@ -327,6 +302,32 @@ func (s *Shell) input(ch byte) {
 			s.emitprompt()
 			s.len = 0
 			s.pos = 0
+		}
+	case ch == ASCII_TAB:
+		ch = ' '
+		fallthrough
+		//case ch >= 0x20 && ch < 0x7f:
+	default:
+		if s.pos < len(s.buffer) {
+			if s.pos == s.len {
+				s.putc(ch)
+				s.buffer[s.pos] = ch
+				s.pos++
+				s.len++
+			} else {
+				s.len++
+				for i := s.len; i > s.pos; i-- {
+					s.buffer[i] = s.buffer[i-1]
+				}
+				s.buffer[s.pos] = ch
+				s.pos++
+				s.redraw()
+				for i := s.pos + 1; i < s.len+1; i++ {
+					s.putc(ASCII_BS)
+				}
+			}
+		} else {
+			s.putc(ASCII_BEL)
 		}
 	}
 }
