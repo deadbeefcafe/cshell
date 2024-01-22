@@ -47,7 +47,7 @@ func TestParseLine(t *testing.T) {
 func TestCli(t *testing.T) {
 
 	// XXX make this actually test something
-	commands := "\r\rtest1 \"foo bar baz\"\r\rtest2\r\rpass\r\r"
+	commands := "\r\rtest1 \"foo bar baz\"\r\rtest2\r!!\r\rpass\r\rhistory\rfoo\r!!\r!3\r"
 
 	cli := New()
 	cli.Command("test1", "a test command [args]", func(args []string) error {

@@ -2,8 +2,10 @@ package cshell
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -22,28 +24,38 @@ const (
 	ASCII_LF    = 0x0A
 	ASCII_ESC   = 0x1B
 	ASCII_DEL   = 0x7F
+
+	FlagHide   = 1 << 0
+	FlagNoargs = 1 << 1
 )
 
 type CommandFunc = func(args []string) error
 type Command struct {
-	name string
-	desc string
-	fx   CommandFunc
+	name  string
+	desc  string
+	fx    CommandFunc
+	flags int
 }
 
 type Shell struct {
-	Prompt   string
-	Echo     bool
-	buffer   []byte
-	pos      int
-	len      int
-	state    int
-	out      io.Writer
-	inp      io.Reader
-	commands []Command
-	history  []string
-	hpos     int
+	Prompt     string
+	Echo       bool
+	buffer     []byte
+	pos        int
+	len        int
+	state      int
+	out        io.Writer
+	inp        io.Reader
+	run        bool
+	commands   []Command
+	history    []string
+	scrollback int
+	savebuf    []byte
+	savepos    int
+	savelen    int
 }
+
+var ErrNoSuchCommand = errors.New("no such command")
 
 // Printf sends output to the configured io.Writer
 // Arguments are handled in the manner of fmt.Printf.
@@ -105,6 +117,14 @@ func (s *Shell) redraw() {
 	}
 }
 
+func (s *Shell) erase() {
+	s.putc(ASCII_CR)
+	s.emitprompt()
+	for i := 0; i < s.len; i++ {
+		s.putc(' ')
+	}
+}
+
 func ParseLine(line string) (args []string, err error) {
 	var escaped, doubleQuoted, singleQuoted bool
 	buf := strings.Builder{}
@@ -162,7 +182,7 @@ func ParseLine(line string) (args []string, err error) {
 }
 
 // execute a complete line
-func (s *Shell) execute() {
+func (s *Shell) executeXXXX() {
 
 	//args := strings.Fields(string(s.buffer[:s.len]))
 	//args, err := shellwords.Parse(string(s.buffer[:s.len]))
@@ -215,11 +235,40 @@ func (s *Shell) execute() {
 func (s *Shell) ExecuteLine(line string) {
 	args, err := ParseLine(line)
 	if err != nil {
+		fmt.Printf("ParseLine error: %v\r\n", err)
 		return
 	}
 
 	if len(args) <= 0 {
 		return
+	}
+
+	histLen := len(s.history)
+	//fmt.Printf("histLen=%d\n", histLen)
+	if len(args) == 1 && len(args[0]) > 1 && args[0][0] == '!' {
+		if args[0][1] == '!' {
+			if histLen > 0 {
+				line = s.history[histLen-1]
+				s.Printf("%s\r\n", line)
+			}
+		}
+		if n, err := strconv.Atoi(args[0][1:]); err == nil {
+			if n > 0 && n <= histLen {
+				line = s.history[n-1]
+				s.Printf("%s\r\n", line)
+			}
+		}
+		args, err = ParseLine(line)
+		if err != nil {
+			return
+		}
+	}
+	if line[0] == '!' {
+		return
+	}
+
+	if histLen <= 0 || s.history[histLen-1] != line {
+		s.history = append(s.history, line)
 	}
 
 	var cmd *Command
@@ -253,6 +302,9 @@ func (s *Shell) ExecuteLine(line string) {
 		s.Printf("No such command: %s\r\n", args[0])
 		return
 	}
+	if cmd.flags&FlagNoargs != 0 {
+		args = []string{line}
+	}
 	err = cmd.fx(args)
 	if err != nil {
 		s.Printf("Command %s error: %v\r\n", args[0], err)
@@ -267,8 +319,50 @@ func (s *Shell) Command(name string, desc string, fx CommandFunc) {
 	s.commands = append(s.commands, Command{name: name, desc: desc, fx: fx})
 }
 
+func (s *Shell) CommandOneArg(name string, desc string, fx CommandFunc) {
+	if s == nil {
+		return
+	}
+	s.commands = append(s.commands, Command{name: name, desc: desc, fx: fx, flags: FlagNoargs})
+}
+
+func (s *Shell) SetFlags(name string, flags int) error {
+	for i := range s.commands {
+		c := &s.commands[i]
+		if c.name == name {
+			c.flags = flags
+			return nil
+		}
+	}
+	return ErrNoSuchCommand
+}
+
+func (s *Shell) History(args []string) error {
+	var l int = len(s.history)
+	var start int = 0
+	if len(args) > 1 {
+		if args[1] == "clear" {
+			s.history = []string{}
+			return nil
+		}
+		if i, err := strconv.Atoi(args[1]); err == nil && i > 0 {
+			if i < l {
+				start = l - i
+			}
+		}
+	}
+
+	for i := start; i < len(s.history); i++ {
+		s.Printf("%6d  %s\r\n", i+1, s.history[i])
+	}
+	return nil
+}
+
 func (s *Shell) Help(args []string) error {
 	for _, cmd := range s.commands {
+		if cmd.flags&FlagHide != 0 {
+			continue
+		}
 		s.Printf("%-10.10s %s\r\n", cmd.name, cmd.desc)
 	}
 	return nil
@@ -280,9 +374,52 @@ func (s *Shell) input(ch byte) {
 	case 2:
 		switch ch {
 		case VT100_UP:
-			// history up
+			lh := len(s.history)
+			if lh <= 0 || s.scrollback >= lh {
+				s.putc(ASCII_BEL)
+				break
+			}
+			if s.scrollback == 0 {
+				s.savepos = s.pos
+				s.savelen = s.len
+				copy(s.savebuf, s.buffer)
+			}
+			s.erase()
+			s.scrollback++
+			line := s.history[lh-s.scrollback]
+			s.pos = len(line)
+			s.len = s.pos
+			for i := 0; i < s.pos; i++ {
+				s.buffer[i] = line[i]
+			}
+			s.redraw()
 		case VT100_DOWN:
-			// history down
+			if s.scrollback <= 0 {
+
+			}
+			if s.scrollback <= 0 {
+				s.putc(ASCII_BEL)
+				s.scrollback = 0
+				break
+			}
+			s.scrollback--
+			if s.scrollback == 0 {
+				s.erase()
+				s.pos = s.savepos
+				s.len = s.savelen
+				copy(s.buffer, s.savebuf)
+				s.redraw()
+				break
+			}
+			s.erase()
+			lh := len(s.history)
+			line := s.history[lh-s.scrollback]
+			s.pos = len(line)
+			s.len = s.pos
+			for i := 0; i < s.pos; i++ {
+				s.buffer[i] = line[i]
+			}
+			s.redraw()
 		case VT100_RIGHT:
 			if s.pos < s.len {
 				s.putc(s.buffer[s.pos])
@@ -321,6 +458,7 @@ func (s *Shell) input(ch byte) {
 		s.ExecuteLine(string(s.buffer[:s.len]))
 		s.len = 0
 		s.pos = 0
+		s.scrollback = 0
 		s.emitprompt()
 	case ch == ASCII_DEL:
 		if s.pos <= 0 {
@@ -383,12 +521,17 @@ func (s *Shell) input(ch byte) {
 	}
 }
 
+func (s *Shell) Terminate() {
+	s.run = false
+}
+
 // Run reads and writes from the io streams generating the
 // command prompt and executing commands.
 func (s *Shell) Run() {
 	buf := make([]byte, 8)
 	s.emitprompt()
-	for {
+	s.run = true
+	for s.run {
 		n, err := s.inp.Read(buf)
 		//fmt.Printf("XXXXXXX n=%d buf=<%s>\n\n", n, string(buf))
 		if err != nil {
@@ -426,10 +569,12 @@ func (s *Shell) SetPrompt(prompt string) {
 // New creates a new command prompt.
 func New() (s *Shell) {
 	s = &Shell{
-		Prompt: "cshell> ",
-		Echo:   true,
-		buffer: make([]byte, 256),
+		Prompt:  "cshell> ",
+		Echo:    true,
+		buffer:  make([]byte, 256),
+		savebuf: make([]byte, 256),
 	}
 	s.Command("help", "Print commands", s.Help)
+	s.Command("history", "[n] Print command history", s.History)
 	return
 }
