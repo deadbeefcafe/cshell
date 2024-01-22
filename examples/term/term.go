@@ -15,12 +15,22 @@ func main() {
 	sh.SetPrompt("mysh> ")
 
 	sh.Command("foo", "do foo", func(args []string) error {
-		sh.Printf("XXXX doing foo\r\n")
+		sh.Printf("FOO args= %#v\r\n", args)
+		return nil
+	})
+
+	sh.Command("dev info", "do foo bar", func(args []string) error {
+		sh.Printf("DEV INFO args= %#v\r\n", args)
+		return nil
+	})
+
+	sh.Command("dev info all the stuff", "big long command", func(args []string) error {
+		sh.Printf("DEV INFO args= %#v\r\n", args)
 		return nil
 	})
 
 	sh.Command("bar", "do bar", func(args []string) error {
-		sh.Printf("YYYY doing bar\r\n")
+		sh.Printf("BAR args= %#v\r\n", args)
 		return nil
 	})
 
@@ -30,8 +40,7 @@ func main() {
 	})
 
 	sh.CommandOneArg("baz", "a one arg command", func(args []string) error {
-		sh.Printf("len(args) = %d\r\n", len(args))
-		sh.Printf("args=%#v\r\n", args)
+		sh.Printf("BAZ #args=%d args=%#v\r\n", len(args), args)
 		return nil
 	})
 

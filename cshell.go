@@ -1,10 +1,12 @@
 package cshell
 
 import (
+	"bufio"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"unicode"
@@ -27,6 +29,7 @@ const (
 
 	FlagHide   = 1 << 0
 	FlagNoargs = 1 << 1
+	FlagAlias  = 1 << 2
 )
 
 type CommandFunc = func(args []string) error
@@ -181,94 +184,127 @@ func ParseLine(line string) (args []string, err error) {
 	return
 }
 
-// execute a complete line
-func (s *Shell) executeXXXX() {
-
-	//args := strings.Fields(string(s.buffer[:s.len]))
-	//args, err := shellwords.Parse(string(s.buffer[:s.len]))
-	args, err := ParseLine(string(s.buffer[:s.len]))
-	if err != nil {
-		return
-	}
-
-	if len(args) <= 0 {
-		return
-	}
-
-	var cmd *Command
-	for i, _ := range s.commands {
-		c := &s.commands[i]
-		if c.name == args[0] {
-			cmd = c
-			break
-		}
-		if strings.HasPrefix(c.name, args[0]) {
-			if cmd != nil {
-				s.Printf("Error: multiple matches\r\n")
-				return
-			}
-			cmd = c
-		}
-	}
-
-	if cmd == nil {
-		// default command
-		for i, _ := range s.commands {
-			c := &s.commands[i]
-			if c.name == "*" {
-				cmd = c
-				break
-			}
-		}
-	}
-
-	if cmd == nil {
-		s.Printf("No such command: %s\r\n", args[0])
-		return
-	}
-	err = cmd.fx(args)
-	if err != nil {
-		s.Printf("Command %s error: %v\r\n", args[0], err)
-	}
+// AddHistory adds a line to the history
+func (s *Shell) AddHistory(line string) {
+	s.history = append(s.history, line)
 }
 
-func (s *Shell) ExecuteLine(line string) {
-	args, err := ParseLine(line)
+// GetHistory returns a copy of the history
+func (s *Shell) GetHistory() (h []string) {
+	h = []string{}
+	for _, line := range s.history {
+		h = append(h, line)
+	}
+	return
+}
+
+func (s *Shell) ClearHistory() {
+	s.history = []string{}
+}
+
+// DelHistory removes the last n lines from the history
+func (s *Shell) DelHistory(n int) {
+	l := len(s.history)
+	if n > l {
+		n = l
+	}
+	s.history = s.history[:l-n]
+}
+
+func (s *Shell) LoadHistory(filename string) (err error) {
+	var file *os.File
+	file, err = os.Open(filename)
 	if err != nil {
-		fmt.Printf("ParseLine error: %v\r\n", err)
 		return
 	}
+	defer file.Close()
+	s.history = []string{}
 
-	if len(args) <= 0 {
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		s.history = append(s.history, scanner.Text())
+	}
+	return
+}
+
+func (s *Shell) SaveHistory(filename string) (err error) {
+	if len(s.history) <= 0 {
+		return
+	}
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	for _, line := range s.history {
+		_, err = io.WriteString(file, line+"\n")
+		if err != nil {
+			return err
+		}
+	}
+	return
+}
+
+func (s *Shell) SearchHistory(match string) (line string) {
+	histLen := len(s.history)
+	if histLen <= 0 {
+		return
+	}
+	for x := histLen - 1; x >= 0; x-- {
+		if strings.HasPrefix(s.history[x], match) {
+			return s.history[x]
+		}
+	}
+	return
+}
+
+func (s *Shell) ExecuteLine(line string) (err error) {
+	if line == "" {
 		return
 	}
 
 	histLen := len(s.history)
-	//fmt.Printf("histLen=%d\n", histLen)
-	if len(args) == 1 && len(args[0]) > 1 && args[0][0] == '!' {
-		if args[0][1] == '!' {
+	if line[0] == '!' {
+		if line == "!!" {
+			// repeat last command
 			if histLen > 0 {
 				line = s.history[histLen-1]
-				s.Printf("%s\r\n", line)
 			}
-		}
-		if n, err := strconv.Atoi(args[0][1:]); err == nil {
+		} else if n, err := strconv.Atoi(line[1:]); err == nil {
 			if n > 0 && n <= histLen {
 				line = s.history[n-1]
-				s.Printf("%s\r\n", line)
 			}
-		}
-		args, err = ParseLine(line)
-		if err != nil {
-			return
+		} else if x := s.SearchHistory(line[1:]); x != "" {
+			line = x
+		} else {
+			s.Printf("%s: not found\r\n", line)
+			return nil
 		}
 	}
-	if line[0] == '!' {
+
+	line = strings.TrimLeft(line, " \t")
+
+	// lines prefixed with @ are not added to the history
+	addhist := true
+	if line[0] == '@' {
+		addhist = false
+		line = line[1:]
+	}
+
+	if addhist {
+		if histLen <= 0 || s.history[histLen-1] != line {
+			s.history = append(s.history, line)
+		}
+	}
+
+	// lines prefixed with # are comments.
+	if line[0] == '#' {
 		return
 	}
 
-	if histLen <= 0 || s.history[histLen-1] != line {
-		s.history = append(s.history, line)
+	args, err := ParseLine(line)
+	if err != nil {
+		return
 	}
 
 	var cmd *Command
@@ -310,6 +346,7 @@ func (s *Shell) ExecuteLine(line string) {
 		s.Printf("Command %s error: %v\r\n", args[0], err)
 	}
 
+	return
 }
 
 func (s *Shell) Command(name string, desc string, fx CommandFunc) {
@@ -341,17 +378,44 @@ func (s *Shell) History(args []string) error {
 	var l int = len(s.history)
 	var start int = 0
 	if len(args) > 1 {
-		if args[1] == "clear" {
-			s.history = []string{}
+		switch args[1] {
+		case "clear", "-c":
+			s.ClearHistory()
 			return nil
-		}
-		if i, err := strconv.Atoi(args[1]); err == nil && i > 0 {
-			if i < l {
-				start = l - i
+		case "save":
+			if len(args) > 2 {
+				if err := s.SaveHistory(args[2]); err != nil {
+					s.Printf("Save %s: %v\r\n", args[2], err)
+				}
 			}
+			return nil
+		case "load":
+			if len(args) > 2 {
+				if err := s.LoadHistory(args[2]); err != nil {
+					s.Printf("Load %s: %v\r\n", args[2], err)
+				}
+			}
+			return nil
+		case "del":
+			if len(args) > 2 {
+				if n, err := strconv.Atoi(args[2]); err == nil {
+					s.DelHistory(n + 1)
+				}
+			} else {
+				s.DelHistory(2) // remove current command (history) plus previous
+			}
+			return nil
+		default:
+			if i, err := strconv.Atoi(args[1]); err == nil && i > 0 {
+				if i < l {
+					start = l - i
+				}
+			}
+
 		}
 	}
 
+	//s.Printf("XXX args=%#v\r\n", args)
 	for i := start; i < len(s.history); i++ {
 		s.Printf("%6d  %s\r\n", i+1, s.history[i])
 	}
@@ -359,11 +423,23 @@ func (s *Shell) History(args []string) error {
 }
 
 func (s *Shell) Help(args []string) error {
+
+	longest := 0
+	if longest < 10 {
+		longest = 10
+	}
+	for _, cmd := range s.commands {
+		l := len(cmd.name)
+		if l > longest {
+			longest = l
+		}
+	}
+
 	for _, cmd := range s.commands {
 		if cmd.flags&FlagHide != 0 {
 			continue
 		}
-		s.Printf("%-10.10s %s\r\n", cmd.name, cmd.desc)
+		s.Printf("%-[2]*.[3]*[1]s  %[4]s\r\n", cmd.name, longest, longest, cmd.desc)
 	}
 	return nil
 }
@@ -493,6 +569,7 @@ func (s *Shell) input(ch byte) {
 			s.pos = 0
 		}
 	case ch == ASCII_TAB:
+		// XXX do completion here
 		ch = ' '
 		fallthrough
 		//case ch >= 0x20 && ch < 0x7f:
@@ -571,10 +648,10 @@ func New() (s *Shell) {
 	s = &Shell{
 		Prompt:  "cshell> ",
 		Echo:    true,
-		buffer:  make([]byte, 256),
-		savebuf: make([]byte, 256),
+		buffer:  make([]byte, 512),
+		savebuf: make([]byte, 512),
 	}
 	s.Command("help", "Print commands", s.Help)
-	s.Command("history", "[n] Print command history", s.History)
+	s.Command("history", "[n|del [n]|-c|clear|save <file>|load <file>] Command history", s.History)
 	return
 }
