@@ -303,7 +303,7 @@ func (s *Shell) ExecuteLine(line string) (err error) {
 	}
 
 	args, err := ParseLine(line)
-	if err != nil {
+	if err != nil || len(args) == 0 {
 		return
 	}
 
