@@ -2,7 +2,7 @@ module term
 
 go 1.21.6
 
-replace github.com/deadbeefcafe/cshell => ../../../cshell
+replace github.com/deadbeefcafe/cshell => ../..
 
 //github.com/deadbeefcafe/cshell v1.2.1
 require github.com/pkg/term v1.1.0

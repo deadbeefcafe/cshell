@@ -130,11 +130,13 @@ func (s *Shell) erase() {
 
 func ParseLine(line string) (args []string, err error) {
 	var escaped, doubleQuoted, singleQuoted bool
+	var tokenStarted bool
 	buf := strings.Builder{}
 
 	for _, r := range line {
 		if escaped {
 			buf.WriteRune(r)
+			tokenStarted = true
 			escaped = false
 			continue
 		}
@@ -144,6 +146,7 @@ func ParseLine(line string) (args []string, err error) {
 			} else {
 				escaped = true
 			}
+			tokenStarted = true
 			continue
 		}
 		if unicode.IsSpace(r) {
@@ -151,28 +154,32 @@ func ParseLine(line string) (args []string, err error) {
 				buf.WriteRune(r)
 				continue
 			}
-			if buf.Len() > 0 {
+			if tokenStarted {
 				args = append(args, buf.String())
 				buf.Reset()
+				tokenStarted = false
 			}
 			continue
 		}
 		switch r {
 		case '"':
 			if !singleQuoted {
+				tokenStarted = true
 				doubleQuoted = !doubleQuoted
 				continue
 			}
 		case '\'':
 			if !doubleQuoted {
+				tokenStarted = true
 				singleQuoted = !singleQuoted
 				continue
 			}
 		}
 		buf.WriteRune(r)
+		tokenStarted = true
 	}
 
-	if buf.Len() > 0 {
+	if tokenStarted {
 		args = append(args, buf.String())
 	}
 
@@ -204,6 +211,9 @@ func (s *Shell) ClearHistory() {
 
 // DelHistory removes the last n lines from the history
 func (s *Shell) DelHistory(n int) {
+	if n <= 0 {
+		return
+	}
 	l := len(s.history)
 	if n > l {
 		n = l
@@ -218,12 +228,15 @@ func (s *Shell) LoadHistory(filename string) (err error) {
 		return
 	}
 	defer file.Close()
-	s.history = []string{}
-
+	history := []string{}
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		s.history = append(s.history, scanner.Text())
+		history = append(history, scanner.Text())
 	}
+	if err = scanner.Err(); err != nil {
+		return
+	}
+	s.history = history
 	return
 }
 
@@ -259,6 +272,7 @@ func (s *Shell) SearchHistory(match string) (line string) {
 }
 
 func (s *Shell) ExecuteLine(line string) (err error) {
+	line = strings.TrimLeft(line, " \t")
 	if line == "" {
 		return
 	}
@@ -269,10 +283,16 @@ func (s *Shell) ExecuteLine(line string) (err error) {
 			// repeat last command
 			if histLen > 0 {
 				line = s.history[histLen-1]
+			} else {
+				s.Printf("%s: not found\r\n", line)
+				return nil
 			}
 		} else if n, err := strconv.Atoi(line[1:]); err == nil {
 			if n > 0 && n <= histLen {
 				line = s.history[n-1]
+			} else {
+				s.Printf("%s: not found\r\n", line)
+				return nil
 			}
 		} else if x := s.SearchHistory(line[1:]); x != "" {
 			line = x
@@ -283,12 +303,18 @@ func (s *Shell) ExecuteLine(line string) (err error) {
 	}
 
 	line = strings.TrimLeft(line, " \t")
+	if line == "" {
+		return
+	}
 
 	// lines prefixed with @ are not added to the history
 	addhist := true
 	if line[0] == '@' {
 		addhist = false
-		line = line[1:]
+		line = strings.TrimLeft(line[1:], " \t")
+		if line == "" {
+			return
+		}
 	}
 
 	if addhist {
@@ -463,6 +489,9 @@ func (s *Shell) input(ch byte) {
 			s.erase()
 			s.scrollback++
 			line := s.history[lh-s.scrollback]
+			if len(line) > len(s.buffer) {
+				line = line[:len(s.buffer)]
+			}
 			s.pos = len(line)
 			s.len = s.pos
 			for i := 0; i < s.pos; i++ {
@@ -490,6 +519,9 @@ func (s *Shell) input(ch byte) {
 			s.erase()
 			lh := len(s.history)
 			line := s.history[lh-s.scrollback]
+			if len(line) > len(s.buffer) {
+				line = line[:len(s.buffer)]
+			}
 			s.pos = len(line)
 			s.len = s.pos
 			for i := 0; i < s.pos; i++ {
@@ -565,16 +597,17 @@ func (s *Shell) input(ch byte) {
 		if s.Echo {
 			s.puts("\r\n")
 			s.emitprompt()
-			s.len = 0
-			s.pos = 0
 		}
+		s.len = 0
+		s.pos = 0
+		s.scrollback = 0
 	case ch == ASCII_TAB:
 		// XXX do completion here
 		ch = ' '
 		fallthrough
 		//case ch >= 0x20 && ch < 0x7f:
 	default:
-		if s.pos < len(s.buffer) {
+		if s.len < len(s.buffer) {
 			if s.pos == s.len {
 				s.putc(ch)
 				s.buffer[s.pos] = ch
@@ -582,7 +615,7 @@ func (s *Shell) input(ch byte) {
 				s.len++
 			} else {
 				s.len++
-				for i := s.len; i > s.pos; i-- {
+				for i := s.len - 1; i > s.pos; i-- {
 					s.buffer[i] = s.buffer[i-1]
 				}
 				s.buffer[s.pos] = ch
@@ -611,10 +644,6 @@ func (s *Shell) Run() {
 	for s.run {
 		n, err := s.inp.Read(buf)
 		//fmt.Printf("XXXXXXX n=%d buf=<%s>\n\n", n, string(buf))
-		if err != nil {
-			fmt.Printf("read input error: %v\n", err)
-			return
-		}
 		for i := 0; i < n; i++ {
 			if buf[i] == ASCII_CTRLD {
 				s.puts("\r\n")
@@ -622,6 +651,12 @@ func (s *Shell) Run() {
 			}
 			//fmt.Printf("n=%d %3d 0x%2.2x %c\r\n", n, buf[i], buf[i], buf[i])
 			s.input(buf[i])
+		}
+		if err != nil {
+			if err != io.EOF {
+				s.Printf("read input error: %v\n", err)
+			}
+			return
 		}
 	}
 }
