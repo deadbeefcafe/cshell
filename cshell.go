@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode"
@@ -41,21 +42,35 @@ type Command struct {
 }
 
 type Shell struct {
-	Prompt     string
-	Echo       bool
-	buffer     []byte
-	pos        int
-	len        int
-	state      int
-	out        io.Writer
-	inp        io.Reader
-	run        bool
-	commands   []Command
-	history    []string
-	scrollback int
-	savebuf    []byte
-	savepos    int
-	savelen    int
+	Prompt string
+	Echo   bool
+	// AllowHistoryFiles enables the "save <file>" and "load <file>" subcommands
+	// of the built-in history command.  It is disabled by default because the
+	// file name comes from shell input, which otherwise gives anyone holding a
+	// shell session an arbitrary file read (load) and file overwrite (save)
+	// primitive against the process running the shell.
+	AllowHistoryFiles bool
+	// HistoryFileDir optionally restricts the files that the history save/load
+	// subcommands may touch.  A relative name is resolved against it and a
+	// resolved path that escapes the directory, including through a symlink, is
+	// rejected.  Empty imposes no restriction beyond AllowHistoryFiles.
+	HistoryFileDir string
+	buffer         []byte
+	pos            int
+	len            int
+	state          int
+	out            io.Writer
+	inp            io.Reader
+	run            bool
+	commands       []Command
+	history        []string
+	scrollback     int
+	savebuf        []byte
+	savepos        int
+	savelen        int
+	// lastCR records that the previous input byte was a carriage return so that
+	// a CRLF pair collapses into a single line terminator.
+	lastCR bool
 }
 
 var ErrNoSuchCommand = errors.New("no such command")
@@ -240,6 +255,10 @@ func (s *Shell) LoadHistory(filename string) (err error) {
 	return
 }
 
+// ErrHistoryFilesDisabled is returned by the history save/load subcommands
+// while Shell.AllowHistoryFiles is false.
+var ErrHistoryFilesDisabled = errors.New("history file access is disabled, set Shell.AllowHistoryFiles to enable it")
+
 func (s *Shell) SaveHistory(filename string) (err error) {
 	if len(s.history) <= 0 {
 		return
@@ -256,6 +275,58 @@ func (s *Shell) SaveHistory(filename string) (err error) {
 		}
 	}
 	return
+}
+
+// historyFilePath validates a file name passed to the history save/load
+// subcommands.  With AllowHistoryFiles false the subcommands are refused.  With
+// HistoryFileDir set, a relative name is resolved against that directory and
+// the resolved path must stay inside it.
+func (s *Shell) historyFilePath(name string) (string, error) {
+	if !s.AllowHistoryFiles {
+		return "", ErrHistoryFilesDisabled
+	}
+	if s.HistoryFileDir == "" {
+		return name, nil
+	}
+	base, err := filepath.Abs(s.HistoryFileDir)
+	if err != nil {
+		return "", fmt.Errorf("history dir: %v", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	if _, err := os.Stat(base); err != nil {
+		return "", fmt.Errorf("history dir %s: %v", s.HistoryFileDir, err)
+	}
+	target := name
+	if filepath.IsAbs(target) {
+		target = filepath.Clean(target)
+	} else {
+		target = filepath.Join(base, target)
+	}
+	// A name may not escape the directory, and neither may any symlink it is
+	// reached through, so resolve the deepest component that exists and check
+	// that it lands inside base.
+	path := target
+	for {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			path = resolved
+			break
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+	}
+	if !withinDir(path, base) {
+		return "", fmt.Errorf("%s: outside of %s", name, s.HistoryFileDir)
+	}
+	return target, nil
+}
+
+func withinDir(path, dir string) bool {
+	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
 func (s *Shell) SearchHistory(match string) (line string) {
@@ -410,14 +481,18 @@ func (s *Shell) History(args []string) error {
 			return nil
 		case "save":
 			if len(args) > 2 {
-				if err := s.SaveHistory(args[2]); err != nil {
+				if path, err := s.historyFilePath(args[2]); err != nil {
+					s.Printf("Save %s: %v\r\n", args[2], err)
+				} else if err := s.SaveHistory(path); err != nil {
 					s.Printf("Save %s: %v\r\n", args[2], err)
 				}
 			}
 			return nil
 		case "load":
 			if len(args) > 2 {
-				if err := s.LoadHistory(args[2]); err != nil {
+				if path, err := s.historyFilePath(args[2]); err != nil {
+					s.Printf("Load %s: %v\r\n", args[2], err)
+				} else if err := s.LoadHistory(path); err != nil {
 					s.Printf("Load %s: %v\r\n", args[2], err)
 				}
 			}
@@ -472,6 +547,8 @@ func (s *Shell) Help(args []string) error {
 
 // input will process a single character generating the shell behavior.
 func (s *Shell) input(ch byte) {
+	lastCR := s.lastCR
+	s.lastCR = false
 	switch s.state {
 	case 2:
 		switch ch {
@@ -559,7 +636,15 @@ func (s *Shell) input(ch byte) {
 	}
 
 	switch {
-	case ch == ASCII_CR:
+	case ch == ASCII_CR || ch == ASCII_LF:
+		// A line may be terminated by CR, by LF, or by a CR immediately followed
+		// by LF, in which case the LF is discarded.
+		if ch == ASCII_LF && lastCR {
+			return
+		}
+		if ch == ASCII_CR {
+			s.lastCR = true
+		}
 		s.putc(ASCII_CR)
 		s.putc(ASCII_LF)
 		//s.execute()
@@ -568,7 +653,7 @@ func (s *Shell) input(ch byte) {
 		s.pos = 0
 		s.scrollback = 0
 		s.emitprompt()
-	case ch == ASCII_DEL:
+	case ch == ASCII_DEL || ch == ASCII_BS:
 		if s.pos <= 0 {
 			s.putc(ASCII_BEL)
 		} else {
@@ -605,8 +690,14 @@ func (s *Shell) input(ch byte) {
 		// XXX do completion here
 		ch = ' '
 		fallthrough
-		//case ch >= 0x20 && ch < 0x7f:
 	default:
+		// The control characters not handled above are dropped rather than
+		// echoed and stored.  Writing them to the output lets remote input drive
+		// the terminal (BEL, BS, form feed, ...), and storing them in the line
+		// buffer would hand raw control bytes to commands in their args.
+		if ch < 0x20 {
+			return
+		}
 		if s.len < len(s.buffer) {
 			if s.pos == s.len {
 				s.putc(ch)
@@ -639,6 +730,7 @@ func (s *Shell) Terminate() {
 // command prompt and executing commands.
 func (s *Shell) Run() {
 	buf := make([]byte, 8)
+	s.lastCR = false
 	s.emitprompt()
 	s.run = true
 	for s.run {

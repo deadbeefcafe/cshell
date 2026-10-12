@@ -7,6 +7,8 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -251,6 +253,248 @@ func TestCli(t *testing.T) {
 	cli.SetIO(strings.NewReader(commands), os.Stdout)
 	cli.Run()
 
+}
+
+func TestExecuteLineHistoryFilesDisabledByDefault(t *testing.T) {
+	dir, err := ioutil.TempDir("", "cshell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	secret := filepath.Join(dir, "secret.txt")
+	if err := ioutil.WriteFile(secret, []byte("TOPSECRET\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(dir, "victim.txt")
+	if err := ioutil.WriteFile(victim, []byte("original\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cli := New()
+	var output strings.Builder
+	cli.AddHistory("some command")
+	cli.SetIO(strings.NewReader(""), &output)
+
+	cli.ExecuteLine("history save " + victim)
+	data, err := ioutil.ReadFile(victim)
+	if err != nil {
+		t.Fatalf("victim file: %v", err)
+	}
+	if string(data) != "original\n" {
+		t.Fatalf("history save overwrote %q while disabled: %q", victim, data)
+	}
+
+	cli.ExecuteLine("history load " + secret)
+	for _, line := range cli.GetHistory() {
+		if strings.Contains(line, "TOPSECRET") {
+			t.Fatalf("history load read %q while disabled: %#v", secret, cli.GetHistory())
+		}
+	}
+	if !strings.Contains(output.String(), "disabled") {
+		t.Fatalf("disabled history file access reported without a hint: %q", output.String())
+	}
+}
+
+func TestExecuteLineHistoryFilesOptIn(t *testing.T) {
+	dir, err := ioutil.TempDir("", "cshell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	cli := New()
+	var output strings.Builder
+	cli.SetIO(strings.NewReader(""), &output)
+	cli.AllowHistoryFiles = true
+
+	cli.AddHistory("saved line")
+	if err := cli.ExecuteLine("history save " + filepath.Join(dir, "hist.txt")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := ioutil.ReadFile(filepath.Join(dir, "hist.txt"))
+	if err != nil {
+		t.Fatalf("history file was not written: %v", err)
+	}
+	if !strings.Contains(string(data), "saved line") {
+		t.Fatalf("history file = %q", data)
+	}
+
+	// A load must replace the history in one step (see LoadHistory).
+	cli.ClearHistory()
+	cli.AddHistory("placeholder")
+	if err := cli.ExecuteLine("history load " + filepath.Join(dir, "hist.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if h := cli.GetHistory(); len(h) == 0 || h[0] != "saved line" {
+		t.Fatalf("history load gave %#v", h)
+	}
+}
+
+func TestExecuteLineHistoryFileDirConfinement(t *testing.T) {
+	base, err := ioutil.TempDir("", "cshell-base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(base)
+	outside, err := ioutil.TempDir("", "cshell-outside")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(outside)
+	secret := filepath.Join(outside, "secret.txt")
+	if err := ioutil.WriteFile(secret, []byte("TOPSECRET\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink inside the sandbox that points outside of it.
+	if err := os.Symlink(secret, filepath.Join(base, "escape")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		arg  string
+		want bool // true when the file name should be accepted
+	}{
+		{"relative inside", "hist.txt", true},
+		{"absolute inside", "", true},
+		{"relative escape", "../outside.txt", false},
+		{"deep relative escape", "a/../../outside.txt", false},
+		{"absolute outside", secret, false},
+		{"symlink inside", "escape", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			arg := tc.arg
+			if arg == "" {
+				arg = filepath.Join(base, "hist.txt")
+			}
+			cli := New()
+			var output strings.Builder
+			cli.AllowHistoryFiles = true
+			cli.HistoryFileDir = base
+			cli.SetIO(strings.NewReader(""), &output)
+			cli.AddHistory("line")
+
+			cli.ExecuteLine("history save " + arg)
+			got := !strings.Contains(output.String(), "outside of") &&
+				!strings.Contains(output.String(), "history dir")
+			if got != tc.want {
+				t.Fatalf("save %q accepted = %v, want %v (output %q)", arg, got, tc.want, output.String())
+			}
+			if tc.want {
+				// The file must have landed inside the sandbox, never in cwd.
+				found := false
+				filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+					if err == nil && info.Mode().IsRegular() && strings.Contains(path, "hist") {
+						found = true
+					}
+					return nil
+				})
+				if !found {
+					t.Fatalf("save %q wrote nothing inside %s", arg, base)
+				}
+			}
+		})
+	}
+
+	// The cwd must not be polluted by a sandboxed relative save.
+	if _, err := os.Stat("hist.txt"); err == nil {
+		t.Fatalf("history save with HistoryFileDir set wrote to the current directory")
+	}
+}
+
+func TestInputLineTerminators(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"carriage return", "foo\r", []string{"foo"}},
+		{"line feed", "foo\n", []string{"foo"}},
+		{"crlf pair", "foo\r\n", []string{"foo"}},
+		{"crlf then lf", "foo\r\nfoo\n", []string{"foo", "foo"}},
+		{"lf terminates mid-line", "foo\nfoo\r", []string{"foo", "foo"}},
+		{"blank lines", "\n\r\nfoo\r", []string{"foo"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := New()
+			var output strings.Builder
+			var got [][]string
+			cli.Command("foo", "", func(args []string) error {
+				got = append(got, args)
+				return nil
+			})
+			cli.SetIO(strings.NewReader(tc.input), &output)
+			cli.Run()
+			if len(got) != len(tc.want) {
+				t.Fatalf("input %q ran %d commands, want %d (args %#v, output %q)", tc.input, len(got), len(tc.want), got, output.String())
+			}
+			for i, name := range tc.want {
+				if !reflect.DeepEqual(got[i], []string{name}) {
+					t.Fatalf("input %q command %d args %#v, want %#v", tc.input, i, got[i], []string{name})
+				}
+			}
+		})
+	}
+}
+
+func TestInputIgnoresUnreachableControlChars(t *testing.T) {
+	cli := New()
+	var output strings.Builder
+	var got []string
+	cli.Command("echo", "", func(args []string) error {
+		got = args
+		return nil
+	})
+	// ^A and BEL are not shell control characters and must not reach the
+	// terminal, the command line, or the command args.
+	cli.SetIO(strings.NewReader("echo a\x01b\x07c\r"), &output)
+	cli.Run()
+
+	want := []string{"echo", "abc"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+	if strings.ContainsAny(output.String(), "\x01\a") {
+		t.Fatalf("control characters were echoed to the output: %q", output.String())
+	}
+}
+
+func TestInputBackspaceDeletesCharacter(t *testing.T) {
+	// Some terminals send ASCII_BS (ctrl-H) where others send ASCII_DEL.
+	cli := New()
+	var output strings.Builder
+	var got []string
+	cli.Command("echo", "", func(args []string) error {
+		got = args
+		return nil
+	})
+	cli.SetIO(strings.NewReader("echo ab\x08c\r"), &output)
+	cli.Run()
+
+	want := []string{"echo", "ac"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
+func TestInputCarriageReturnClearsPendingState(t *testing.T) {
+	// A character consumed by the escape-sequence state machine must not leave a
+	// pending CR state alive, otherwise the next LF would be swallowed.
+	cli := New()
+	var output strings.Builder
+	runs := 0
+	cli.Command("foo", "", func(args []string) error {
+		runs++
+		return nil
+	})
+	cli.Command("bar", "", func(args []string) error {
+		runs++
+		return nil
+	})
+	cli.SetIO(strings.NewReader("foo\r\x1bxbar\n"), &output)
+	cli.Run()
+	if runs != 2 {
+		t.Fatalf("commands ran %d times, want 2 (output %q)", runs, output.String())
+	}
 }
 
 // XXX more test coverage
