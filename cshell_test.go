@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -494,6 +496,188 @@ func TestInputCarriageReturnClearsPendingState(t *testing.T) {
 	cli.Run()
 	if runs != 2 {
 		t.Fatalf("commands ran %d times, want 2 (output %q)", runs, output.String())
+	}
+}
+
+func TestCommandNameResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		names []string
+		line  string
+		ran   string
+		print string // expected output fragment when nothing runs
+	}{
+		{"exact word", []string{"alpha", "beta"}, "alpha", "alpha", ""},
+		{"abbreviated word", []string{"alphabet"}, "alph", "alphabet", ""},
+		{"exact match beats an earlier abbreviation", []string{"alphabet", "alpha"}, "alpha", "alpha", ""},
+		{"ambiguous abbreviation", []string{"ls", "lsof"}, "l", "", "multiple matches"},
+		{"exact match beats a longer prefix match", []string{"ls", "lsof"}, "ls", "ls", ""},
+		{"built-in name matched exactly", nil, "help", "", "Print commands"},
+		{"built-in names are ambiguous", nil, "h", "", "multiple matches"},
+		{"multiple words", []string{"dev info"}, "dev info", "dev info", ""},
+		{"multiple words with arguments", []string{"dev info"}, "dev info all", "dev info", ""},
+		{"longest name named in full wins", []string{"dev info", "dev info all the stuff"}, "dev info all the stuff", "dev info all the stuff", ""},
+		{"abbreviated first word of a name", []string{"dev info"}, "de " + "info", "dev info", ""},
+		{"partial first word is not a name match", []string{"dev info"}, "dev", "", "No such command"},
+		{"matching stops at word boundaries", []string{"dev info"}, "developer info", "", "No such command"},
+		{"quoted words", []string{"dev info"}, `dev "info"`, "dev info", ""},
+		{"names are canonicalized", []string{" dev  info "}, "dev info", "dev info", ""},
+		{"default command", []string{"foo", "*"}, "xyz arg", "*", ""},
+		{"empty word matches nothing", []string{"a", "b"}, `""`, "", "No such command"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cli := New()
+			var output strings.Builder
+			ran := ""
+			for _, n := range tc.names {
+				name := n
+				cli.Command(name, "c", func(args []string) error {
+					ran = canonicalName(name)
+					return nil
+				})
+			}
+			cli.SetIO(strings.NewReader(""), &output)
+			cli.ExecuteLine(tc.line)
+			if ran != tc.ran {
+				t.Fatalf("line %q ran %q, want %q (output %q)", tc.line, ran, tc.ran, output.String())
+			}
+			if tc.print != "" && !strings.Contains(output.String(), tc.print) {
+				t.Fatalf("line %q output %q, want it to mention %q", tc.line, output.String(), tc.print)
+			}
+		})
+	}
+}
+
+func TestSetFlagsAcceptsEquivalentNames(t *testing.T) {
+	cli := New()
+	cli.Command("dev info", "", func(args []string) error { return nil })
+	if err := cli.SetFlags("dev  info", FlagHide); err != nil {
+		t.Fatalf("SetFlags: %v", err)
+	}
+	if err := cli.SetFlags("nope", FlagHide); !errors.Is(err, ErrNoSuchCommand) {
+		t.Fatalf("SetFlags(nope) = %v, want %v", err, ErrNoSuchCommand)
+	}
+}
+
+func TestHistoryRecallSurvivesHistoryChanges(t *testing.T) {
+	// The scrollback index is only valid while the history it was chosen from is
+	// still there, so stepping through a history that changed must not panic.
+	cli := New()
+	var output strings.Builder
+	cli.SetIO(strings.NewReader(""), &output)
+	for _, line := range []string{"one", "two", "three"} {
+		cli.AddHistory(line)
+	}
+	for i := 0; i < 3; i++ {
+		cli.input(ASCII_ESC)
+		cli.input('[')
+		cli.input(VT100_UP)
+	}
+	cli.DelHistory(3)
+	for i := 0; i < 3; i++ {
+		cli.input(ASCII_ESC)
+		cli.input('[')
+		cli.input(VT100_DOWN)
+		cli.input(ASCII_ESC)
+		cli.input('[')
+		cli.input(VT100_UP)
+	}
+	cli.input(ASCII_CR)
+	if cli.scrollback != 0 {
+		t.Fatalf("scrollback = %d after a line was run, want 0", cli.scrollback)
+	}
+	if cli.len != 0 || cli.pos != 0 {
+		t.Fatalf("input line not cleared after run: len=%d pos=%d", cli.len, cli.pos)
+	}
+}
+
+func TestMaxHistoryDropsOldestEntries(t *testing.T) {
+	cli := New()
+	cli.MaxHistory = 3
+	for i := 1; i <= 5; i++ {
+		cli.AddHistory(fmt.Sprintf("cmd%d", i))
+	}
+	want := []string{"cmd3", "cmd4", "cmd5"}
+	if got := cli.GetHistory(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("history = %#v, want %#v", got, want)
+	}
+}
+
+func TestMaxHistoryAppliesToLoadedHistory(t *testing.T) {
+	file, err := ioutil.TempFile("", "cshell-history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+	for i := 1; i <= 5; i++ {
+		if _, err := file.WriteString(fmt.Sprintf("cmd%d\n", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cli := New()
+	cli.MaxHistory = 2
+	if err := cli.LoadHistory(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"cmd4", "cmd5"}
+	if got := cli.GetHistory(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("history = %#v, want %#v", got, want)
+	}
+}
+
+func TestNewLimitsHistoryByDefault(t *testing.T) {
+	cli := New()
+	var output strings.Builder
+	cli.Command("cmd", "", func(args []string) error { return nil })
+	cli.SetIO(strings.NewReader(""), &output)
+	for i := 0; i < 2*defaultMaxHistory+5; i++ {
+		cli.ExecuteLine("cmd " + strconv.Itoa(i))
+	}
+	if got := len(cli.GetHistory()); got > defaultMaxHistory {
+		t.Fatalf("history holds %d entries, want at most %d", got, defaultMaxHistory)
+	}
+}
+
+func TestMaxHistoryZeroKeepsEverything(t *testing.T) {
+	cli := New()
+	cli.MaxHistory = 0
+	for i := 0; i < 3*defaultMaxHistory; i++ {
+		cli.AddHistory("cmd" + strconv.Itoa(i))
+	}
+	if got, want := len(cli.GetHistory()), 3*defaultMaxHistory; got != want {
+		t.Fatalf("history holds %d entries, want %d", got, want)
+	}
+}
+
+func TestShellWithoutStreamsDoesNotPanic(t *testing.T) {
+	// A shell that was never given streams must stay quiet rather than crash the
+	// program that embedded it.
+	cli := New()
+	cli.ExecuteLine("help")
+	cli.Printf("%d", 1)
+	cli.Print("x")
+	cli.Println("y")
+	cli.HexDump([]byte{1})
+	cli.Run()
+	cli2 := New()
+	cli2.SetIO(strings.NewReader(""), nil)
+	cli2.ExecuteLine("help")
+	cli2.Run()
+}
+
+func TestCommandWithoutHandlerDoesNotPanic(t *testing.T) {
+	cli := New()
+	var output strings.Builder
+	cli.Command("bad", "no handler", nil)
+	cli.SetIO(strings.NewReader(""), &output)
+	if err := cli.ExecuteLine("bad"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "no handler") {
+		t.Fatalf("missing handler was not reported: %q", output.String())
 	}
 }
 

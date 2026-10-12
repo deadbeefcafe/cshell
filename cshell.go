@@ -55,19 +55,24 @@ type Shell struct {
 	// resolved path that escapes the directory, including through a symlink, is
 	// rejected.  Empty imposes no restriction beyond AllowHistoryFiles.
 	HistoryFileDir string
-	buffer         []byte
-	pos            int
-	len            int
-	state          int
-	out            io.Writer
-	inp            io.Reader
-	run            bool
-	commands       []Command
-	history        []string
-	scrollback     int
-	savebuf        []byte
-	savepos        int
-	savelen        int
+	// MaxHistory bounds the number of command lines kept in the history, so that
+	// a long lived session cannot grow it without limit; once it is exceeded the
+	// oldest entries are dropped.  New defaults it to defaultMaxHistory, and 0
+	// keeps every entry.
+	MaxHistory int
+	buffer     []byte
+	pos        int
+	len        int
+	state      int
+	out        io.Writer
+	inp        io.Reader
+	run        bool
+	commands   []Command
+	history    []string
+	scrollback int
+	savebuf    []byte
+	savepos    int
+	savelen    int
 	// lastCR records that the previous input byte was a carriage return so that
 	// a CRLF pair collapses into a single line terminator.
 	lastCR bool
@@ -75,32 +80,46 @@ type Shell struct {
 
 var ErrNoSuchCommand = errors.New("no such command")
 
+// defaultMaxHistory is the history limit New installs.  A history entry is at
+// most one input line long, so this bounds what a session accumulates.
+const defaultMaxHistory = 1000
+
+// writeOut sends p to the configured output, if there is one.  A shell created
+// by New and used before SetIO, or given a nil writer, has nowhere to write;
+// commands still run, they just stay quiet.
+func (s *Shell) writeOut(p []byte) {
+	if s.out == nil {
+		return
+	}
+	s.out.Write(p)
+}
+
 // Printf sends output to the configured io.Writer
 // Arguments are handled in the manner of fmt.Printf.
 func (s *Shell) Printf(format string, v ...interface{}) {
-	s.out.Write([]byte(fmt.Sprintf(format, v...)))
+	s.writeOut([]byte(fmt.Sprintf(format, v...)))
 }
 
 // Println sends output to the configured io.Writer
 // Arguments are handled in the manner of fmt.Println.
 func (s *Shell) Println(v ...interface{}) {
-	s.out.Write([]byte(fmt.Sprintln(v...)))
+	s.writeOut([]byte(fmt.Sprintln(v...)))
 }
 
 // Print sends output to the configured io.Writer
 // Arguments are handled in the manner of fmt.Print.
 func (s *Shell) Print(v ...interface{}) {
-	s.out.Write([]byte(fmt.Sprint(v...)))
+	s.writeOut([]byte(fmt.Sprint(v...)))
 }
 
 // output a single character
 func (s *Shell) putc(ch byte) {
-	s.out.Write([]byte{ch})
+	s.writeOut([]byte{ch})
 }
 
 // output a string
 func (s *Shell) puts(str string) {
-	s.out.Write([]byte(str))
+	s.writeOut([]byte(str))
 }
 
 // HexDump outputs a `hexdump -C` like dump of the buf argument
@@ -141,6 +160,29 @@ func (s *Shell) erase() {
 	for i := 0; i < s.len; i++ {
 		s.putc(' ')
 	}
+}
+
+// recalledHistory returns the history line the scrollback position currently
+// points at, truncated to fit the input buffer.  It reports false when that
+// position is no longer part of the history, which can happen if the history
+// changed while a recall was in progress.
+func (s *Shell) recalledHistory() (string, bool) {
+	lh := len(s.history)
+	if s.scrollback <= 0 || s.scrollback > lh {
+		return "", false
+	}
+	line := s.history[lh-s.scrollback]
+	if len(line) > len(s.buffer) {
+		line = line[:len(s.buffer)]
+	}
+	return line, true
+}
+
+// setPosition makes the input buffer hold line with the cursor after it.
+func (s *Shell) setPosition(line string) {
+	s.pos = len(line)
+	s.len = s.pos
+	copy(s.buffer, line)
 }
 
 func ParseLine(line string) (args []string, err error) {
@@ -208,7 +250,20 @@ func ParseLine(line string) (args []string, err error) {
 
 // AddHistory adds a line to the history
 func (s *Shell) AddHistory(line string) {
+	s.addHistoryLine(line)
+}
+
+// addHistoryLine appends one line, dropping the oldest entries once MaxHistory
+// is reached.  It reuses the backing array so that a bounded history does not
+// allocate on every command.
+func (s *Shell) addHistoryLine(line string) {
 	s.history = append(s.history, line)
+	if s.MaxHistory <= 0 || len(s.history) <= s.MaxHistory {
+		return
+	}
+	drop := len(s.history) - s.MaxHistory
+	copy(s.history, s.history[drop:])
+	s.history = s.history[:s.MaxHistory]
 }
 
 // GetHistory returns a copy of the history
@@ -250,6 +305,9 @@ func (s *Shell) LoadHistory(filename string) (err error) {
 	}
 	if err = scanner.Err(); err != nil {
 		return
+	}
+	if s.MaxHistory > 0 && len(history) > s.MaxHistory {
+		history = history[len(history)-s.MaxHistory:]
 	}
 	s.history = history
 	return
@@ -342,6 +400,70 @@ func (s *Shell) SearchHistory(match string) (line string) {
 	return
 }
 
+// canonicalName folds a command name so that it can only match whole words of a
+// command line: leading and trailing space is dropped and runs of space inside
+// the name collapse into one.
+func canonicalName(name string) string {
+	return strings.Join(strings.Fields(name), " ")
+}
+
+// lookupCommand resolves the command that a parsed command line runs.  A
+// command name may consist of more than one word, in which case all of its
+// words must match the leading words of the line, and any command may be
+// abbreviated by a prefix of its first word.  An exact match takes precedence
+// over an abbreviation.  The second result reports that more than one command
+// matched and none of them was named in full, so the choice would be a guess.
+func (s *Shell) lookupCommand(args []string) (*Command, bool) {
+	if len(args) == 0 || args[0] == "" {
+		return nil, false
+	}
+	var (
+		exact     *Command
+		abbrev    *Command
+		ambiguous bool
+	)
+	for i := range s.commands {
+		c := &s.commands[i]
+		name := strings.Fields(c.name)
+		if len(name) == 0 || len(name) > len(args) {
+			continue
+		}
+		// The first word may be abbreviated, the rest must be spelled out.
+		if name[0] != args[0] && !strings.HasPrefix(name[0], args[0]) {
+			continue
+		}
+		ok := true
+		for j := 1; j < len(name); j++ {
+			if name[j] != args[j] {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		if len(name) == len(args) && name[0] == args[0] {
+			// named in full; the first registration wins
+			if exact == nil {
+				exact = c
+			}
+			continue
+		}
+		if exact != nil {
+			continue
+		}
+		if abbrev != nil {
+			ambiguous = true
+		} else {
+			abbrev = c
+		}
+	}
+	if exact != nil {
+		return exact, false
+	}
+	return abbrev, abbrev != nil && ambiguous
+}
+
 func (s *Shell) ExecuteLine(line string) (err error) {
 	line = strings.TrimLeft(line, " \t")
 	if line == "" {
@@ -389,8 +511,8 @@ func (s *Shell) ExecuteLine(line string) (err error) {
 	}
 
 	if addhist {
-		if histLen <= 0 || s.history[histLen-1] != line {
-			s.history = append(s.history, line)
+		if last := len(s.history); last <= 0 || s.history[last-1] != line {
+			s.addHistoryLine(line)
 		}
 	}
 
@@ -404,25 +526,15 @@ func (s *Shell) ExecuteLine(line string) (err error) {
 		return
 	}
 
-	var cmd *Command
-	for i, _ := range s.commands {
-		c := &s.commands[i]
-		if c.name == args[0] {
-			cmd = c
-			break
-		}
-		if strings.HasPrefix(c.name, args[0]) {
-			if cmd != nil {
-				s.Printf("Error: multiple matches\r\n")
-				return
-			}
-			cmd = c
-		}
+	cmd, ambiguous := s.lookupCommand(args)
+	if ambiguous {
+		s.Printf("Error: multiple matches\r\n")
+		return
 	}
 
 	if cmd == nil {
 		// default command
-		for i, _ := range s.commands {
+		for i := range s.commands {
 			c := &s.commands[i]
 			if c.name == "*" {
 				cmd = c
@@ -433,6 +545,12 @@ func (s *Shell) ExecuteLine(line string) (err error) {
 
 	if cmd == nil {
 		s.Printf("No such command: %s\r\n", args[0])
+		return
+	}
+	if cmd.fx == nil {
+		// Registered with no handler, which is a configuration error the
+		// embedding program has to fix; do not panic the session over it.
+		s.Printf("Command %s: no handler registered\r\n", args[0])
 		return
 	}
 	if cmd.flags&FlagNoargs != 0 {
@@ -450,17 +568,18 @@ func (s *Shell) Command(name string, desc string, fx CommandFunc) {
 	if s == nil {
 		return
 	}
-	s.commands = append(s.commands, Command{name: name, desc: desc, fx: fx})
+	s.commands = append(s.commands, Command{name: canonicalName(name), desc: desc, fx: fx})
 }
 
 func (s *Shell) CommandOneArg(name string, desc string, fx CommandFunc) {
 	if s == nil {
 		return
 	}
-	s.commands = append(s.commands, Command{name: name, desc: desc, fx: fx, flags: FlagNoargs})
+	s.commands = append(s.commands, Command{name: canonicalName(name), desc: desc, fx: fx, flags: FlagNoargs})
 }
 
 func (s *Shell) SetFlags(name string, flags int) error {
+	name = canonicalName(name)
 	for i := range s.commands {
 		c := &s.commands[i]
 		if c.name == name {
@@ -565,20 +684,15 @@ func (s *Shell) input(ch byte) {
 			}
 			s.erase()
 			s.scrollback++
-			line := s.history[lh-s.scrollback]
-			if len(line) > len(s.buffer) {
-				line = line[:len(s.buffer)]
+			line, ok := s.recalledHistory()
+			if !ok {
+				s.scrollback--
+				s.putc(ASCII_BEL)
+				break
 			}
-			s.pos = len(line)
-			s.len = s.pos
-			for i := 0; i < s.pos; i++ {
-				s.buffer[i] = line[i]
-			}
+			s.setPosition(line)
 			s.redraw()
 		case VT100_DOWN:
-			if s.scrollback <= 0 {
-
-			}
 			if s.scrollback <= 0 {
 				s.putc(ASCII_BEL)
 				s.scrollback = 0
@@ -593,17 +707,16 @@ func (s *Shell) input(ch byte) {
 				s.redraw()
 				break
 			}
+			line, ok := s.recalledHistory()
+			if !ok {
+				// the history changed underneath the recall, there is nothing
+				// left to step back to
+				s.scrollback = 0
+				s.putc(ASCII_BEL)
+				break
+			}
 			s.erase()
-			lh := len(s.history)
-			line := s.history[lh-s.scrollback]
-			if len(line) > len(s.buffer) {
-				line = line[:len(s.buffer)]
-			}
-			s.pos = len(line)
-			s.len = s.pos
-			for i := 0; i < s.pos; i++ {
-				s.buffer[i] = line[i]
-			}
+			s.setPosition(line)
 			s.redraw()
 		case VT100_RIGHT:
 			if s.pos < s.len {
@@ -731,6 +844,10 @@ func (s *Shell) Terminate() {
 func (s *Shell) Run() {
 	buf := make([]byte, 8)
 	s.lastCR = false
+	if s.inp == nil {
+		// nothing to read, Run would otherwise panic on its first Read
+		return
+	}
 	s.emitprompt()
 	s.run = true
 	for s.run {
@@ -773,10 +890,11 @@ func (s *Shell) SetPrompt(prompt string) {
 // New creates a new command prompt.
 func New() (s *Shell) {
 	s = &Shell{
-		Prompt:  "cshell> ",
-		Echo:    true,
-		buffer:  make([]byte, 512),
-		savebuf: make([]byte, 512),
+		Prompt:     "cshell> ",
+		Echo:       true,
+		MaxHistory: defaultMaxHistory,
+		buffer:     make([]byte, 512),
+		savebuf:    make([]byte, 512),
 	}
 	s.Command("help", "Print commands", s.Help)
 	s.Command("history", "[n|del [n]|-c|clear|save <file>|load <file>] Command history", s.History)
