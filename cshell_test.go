@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 type Vectors struct {
@@ -678,6 +679,150 @@ func TestCommandWithoutHandlerDoesNotPanic(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "no handler") {
 		t.Fatalf("missing handler was not reported: %q", output.String())
+	}
+}
+
+type silentReader struct {
+	remaining int
+	rest      string
+}
+
+func (r *silentReader) Read(p []byte) (int, error) {
+	if r.remaining > 0 {
+		r.remaining--
+		return 0, nil
+	}
+	if r.rest == "" {
+		return 0, io.EOF
+	}
+	n := copy(p, r.rest)
+	r.rest = r.rest[n:]
+	return n, nil
+}
+
+type alwaysSilentReader struct{}
+
+func (alwaysSilentReader) Read([]byte) (int, error) { return 0, nil }
+
+func TestRunGivesUpOnSilentInput(t *testing.T) {
+	// A reader that returns nothing without an error used to leave Run spinning
+	// at full speed.
+	cli := New()
+	var output bytes.Buffer
+	cli.SetIO(alwaysSilentReader{}, &output)
+	done := make(chan struct{})
+	go func() {
+		cli.Run()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return to a reader that never returns data")
+	}
+	if !strings.Contains(output.String(), "no data") {
+		t.Fatalf("silent input was not reported: %q", output.String())
+	}
+}
+
+func TestRunToleratesASilentRead(t *testing.T) {
+	cli := New()
+	var output bytes.Buffer
+	ran := false
+	cli.Command("foo", "", func(args []string) error {
+		ran = true
+		return nil
+	})
+	cli.SetIO(&silentReader{remaining: 1, rest: "foo\r"}, &output)
+	cli.Run()
+	if !ran {
+		t.Fatalf("command after a single silent read did not run (output %q)", output.String())
+	}
+}
+
+func TestControlSequencesDoNotLeakIntoTheLine(t *testing.T) {
+	for _, tc := range []string{
+		"\x1b[3~foo\r",   // Delete
+		"\x1b[15~foo\r",  // F5
+		"\x1b[?25lfoo\r", // hide cursor
+		"\x1b[1;3Hfoo\r", // Home with a modifier
+	} {
+		cli := New()
+		var output bytes.Buffer
+		var got []string
+		cli.Command("foo", "", func(args []string) error {
+			got = args
+			return nil
+		})
+		cli.SetIO(strings.NewReader(tc), &output)
+		cli.Run()
+		if !reflect.DeepEqual(got, []string{"foo"}) {
+			t.Fatalf("input %q ran %#v, want [foo] (output %q)", tc, got, output.String())
+		}
+	}
+}
+
+func TestTerminatorInsideControlSequence(t *testing.T) {
+	// A half finished control sequence must not eat the line terminator, that
+	// would leave the command line stuck.
+	for _, tc := range []string{"foo\x1b[\r", "foo\x1b\n"} {
+		cli := New()
+		var output bytes.Buffer
+		ran := false
+		cli.Command("foo", "", func(args []string) error {
+			ran = true
+			return nil
+		})
+		cli.SetIO(strings.NewReader(tc), &output)
+		cli.Run()
+		if !ran {
+			t.Fatalf("input %q did not run the command (output %q)", tc, output.String())
+		}
+	}
+}
+
+func TestUnboundEscapeSequenceConsumesBothBytes(t *testing.T) {
+	// ESC followed by something this shell does not bind is a meta sequence, so
+	// neither byte reaches the command line, while a plain escape still does not
+	// swallow the whole rest of the line.
+	cli := New()
+	var output bytes.Buffer
+	var got []string
+	cli.Command("oo", "", func(args []string) error {
+		got = args
+		return nil
+	})
+	cli.SetIO(strings.NewReader("\x1bfoo\r"), &output)
+	cli.Run()
+	if !reflect.DeepEqual(got, []string{"oo"}) {
+		t.Fatalf("ran %#v, want [oo] (output %q)", got, output.String())
+	}
+}
+
+func TestHistoryEntriesStayOnOneLine(t *testing.T) {
+	// History is displayed one entry per line and saved to a line oriented file.
+	cli := New()
+	cli.AddHistory("first\nsecond\rthird")
+	for _, line := range cli.GetHistory() {
+		if strings.ContainsAny(line, "\r\n") {
+			t.Fatalf("history entry spans lines: %q", line)
+		}
+	}
+
+	file, err := ioutil.TempFile("", "cshell-history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+	if err := cli.SaveHistory(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	loaded := New()
+	if err := loaded.LoadHistory(file.Name()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := loaded.GetHistory(), cli.GetHistory(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("history did not round trip: %#v, want %#v", got, want)
 	}
 }
 

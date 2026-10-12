@@ -84,6 +84,10 @@ var ErrNoSuchCommand = errors.New("no such command")
 // most one input line long, so this bounds what a session accumulates.
 const defaultMaxHistory = 1000
 
+// maxEmptyReads is how many consecutive reads that return nothing without an
+// error Run tolerates before it gives up on the input.
+const maxEmptyReads = 100
+
 // writeOut sends p to the configured output, if there is one.  A shell created
 // by New and used before SetIO, or given a nil writer, has nowhere to write;
 // commands still run, they just stay quiet.
@@ -257,6 +261,17 @@ func (s *Shell) AddHistory(line string) {
 // is reached.  It reuses the backing array so that a bounded history does not
 // allocate on every command.
 func (s *Shell) addHistoryLine(line string) {
+	// A history entry is displayed on one line and saved to a line oriented
+	// file, so a line break inside one would corrupt the listing and let a
+	// loaded file carry entries that were never typed.
+	if strings.ContainsAny(line, "\r\n") {
+		line = strings.Map(func(r rune) rune {
+			if r == '\r' || r == '\n' {
+				return ' '
+			}
+			return r
+		}, line)
+	}
 	s.history = append(s.history, line)
 	if s.MaxHistory <= 0 || len(s.history) <= s.MaxHistory {
 		return
@@ -664,12 +679,33 @@ func (s *Shell) Help(args []string) error {
 	return nil
 }
 
+// cancelsSequence reports whether ch interrupts a control sequence, in which
+// case it has to be acted upon as if it had arrived on its own.  A line
+// terminator in particular must not be swallowed by a half finished sequence,
+// that would leave the command line stuck.
+func cancelsSequence(ch byte) bool {
+	return ch == ASCII_CR || ch == ASCII_LF || ch == ASCII_ESC || ch == ASCII_DEL
+}
+
 // input will process a single character generating the shell behavior.
 func (s *Shell) input(ch byte) {
 	lastCR := s.lastCR
 	s.lastCR = false
 	switch s.state {
 	case 2:
+		if cancelsSequence(ch) {
+			// a line terminator or another escape in the middle of a sequence
+			// cancels it, and that byte still means what it says
+			s.state = 0
+			break
+		}
+		// ESC [ ... ends with a byte above 0x3f, so keep consuming while the
+		// parameter and intermediate bytes arrive.  Without this a key that
+		// carries a parameter, such as Home, Delete or a function key, leaves
+		// its digits behind on the command line.
+		if ch >= 0x20 && ch <= 0x3f {
+			return
+		}
 		switch ch {
 		case VT100_UP:
 			lh := len(s.history)
@@ -736,14 +772,17 @@ func (s *Shell) input(ch byte) {
 		s.state = 0
 		return
 	case 1:
-
 		if ch == '[' {
 			s.state = 2
 			return
-		} else {
-			s.state = 0
 		}
-		return
+		s.state = 0
+		if !cancelsSequence(ch) {
+			// ESC followed by a plain character is a meta sequence that this
+			// shell does not bind, so both bytes are dropped
+			return
+		}
+		break
 	default:
 		s.state = 0
 	}
@@ -850,8 +889,21 @@ func (s *Shell) Run() {
 	}
 	s.emitprompt()
 	s.run = true
+	empty := 0
 	for s.run {
 		n, err := s.inp.Read(buf)
+		if n == 0 && err == nil {
+			// A zero byte count with no error is not a legal Read.  A reader that
+			// does it once returns data the next time around; one that does it
+			// forever would leave this loop spinning at full speed.
+			empty++
+			if empty > maxEmptyReads {
+				s.Printf("read input error: input returned no data\n")
+				return
+			}
+		} else {
+			empty = 0
+		}
 		//fmt.Printf("XXXXXXX n=%d buf=<%s>\n\n", n, string(buf))
 		for i := 0; i < n; i++ {
 			if buf[i] == ASCII_CTRLD {
