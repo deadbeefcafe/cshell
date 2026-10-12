@@ -826,4 +826,37 @@ func TestHistoryEntriesStayOnOneLine(t *testing.T) {
 	}
 }
 
+func TestExecuteLineReportsNothingToSave(t *testing.T) {
+	// SaveHistory keeps an existing file when the history is empty, which is a
+	// reasonable guard, but the command has to say so.
+	dir, err := ioutil.TempDir("", "cshell")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	victim := filepath.Join(dir, "victim.txt")
+	if err := ioutil.WriteFile(victim, []byte("keep me\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cli := New()
+	cli.AllowHistoryFiles = true
+	var output strings.Builder
+	cli.SetIO(strings.NewReader(""), &output)
+	// the @ prefix keeps the command itself out of the history, so this is the
+	// case where there really is nothing to save
+	cli.ExecuteLine("@history save " + victim)
+
+	if !strings.Contains(output.String(), "history is empty") {
+		t.Fatalf("empty save was not reported: %q", output.String())
+	}
+	data, err := ioutil.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keep me\n" {
+		t.Fatalf("empty save changed %q to %q", victim, data)
+	}
+}
+
 // XXX more test coverage

@@ -617,6 +617,10 @@ func (s *Shell) History(args []string) error {
 			if len(args) > 2 {
 				if path, err := s.historyFilePath(args[2]); err != nil {
 					s.Printf("Save %s: %v\r\n", args[2], err)
+				} else if len(s.history) <= 0 {
+					// SaveHistory leaves an existing file alone when there is
+					// nothing to write, so say so rather than implying a save
+					s.Printf("Save %s: history is empty\r\n", args[2])
 				} else if err := s.SaveHistory(path); err != nil {
 					s.Printf("Save %s: %v\r\n", args[2], err)
 				}
@@ -634,6 +638,7 @@ func (s *Shell) History(args []string) error {
 		case "del":
 			if len(args) > 2 {
 				if n, err := strconv.Atoi(args[2]); err == nil {
+					// one more than asked for, the current command is dropped too
 					s.DelHistory(n + 1)
 				}
 			} else {
